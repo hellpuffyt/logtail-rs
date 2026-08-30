@@ -169,7 +169,9 @@ Key modules (`src/`):
 - `agg.rs` - `Aggregator` and `GroupState`, tying group-by, the
   cardinality guard, and per-field reservoirs together.
 - `follow.rs` - `Follower`, tailing a file with rotation/truncation
-  detection (inode/file-index comparison plus a length check).
+  detection (identity comparison plus a length/handle-vs-path check - see
+  [Follow mode and log rotation](#follow-mode-and-log-rotation) for the
+  platform-specific details).
 - `window.rs` - `--since`/`--until` parsing and tumbling-window bucketing.
 - `output.rs` - table/JSON/NDJSON rendering.
 - `record.rs` - dotted-field lookup and tolerant NDJSON line parsing.
@@ -178,6 +180,46 @@ The whole pipeline is single-pass and streaming: `main.rs` reads one line,
 parses it, evaluates the query, and either emits it immediately (raw
 filter) or folds it into the aggregator - it is never buffered as a
 collection of records.
+
+## Follow mode and log rotation
+
+`-f`/`--follow` needs to notice when the file at `path` has been *replaced*
+(logrotate-style: move the old file aside, create a new one at the same
+name) rather than just appended to, or it would silently keep reading from
+the old, now-disconnected file - the classic way `tail -f` goes stale.
+`logtail` detects this differently per platform, and it is worth being
+precise about what each approach can and cannot see:
+
+- **Unix**: uses the file's inode number (`ino`). A rename-based rotation
+  always changes the inode the path resolves to, so this is a reliable,
+  textbook check.
+- **Windows**: there is no stable-Rust equivalent of an inode.
+  `std::os::windows::fs::MetadataExt::file_index` exists but sits behind
+  the unstable `windows_by_handle` Cargo feature and does not build on
+  stable Rust; obtaining the real NTFS file ID would require an `unsafe`
+  FFI call into `GetFileInformationByHandle`, and this crate forbids
+  `unsafe` entirely (`unsafe_code = "forbid"`). Instead, `logtail` uses the
+  file's creation timestamp (`Metadata::created`, stable and safe) as a
+  rotation signal, backed by a second, platform-independent check: an
+  already-open file handle keeps reporting the size of whatever file it
+  actually refers to, even after the path has been repointed at a
+  different file, while a fresh stat of the path sees the new file: a
+  mismatch there means rotation happened, independent of the timestamp
+  check.
+
+  The known gap on Windows: NTFS file-system tunnelling can make the OS
+  reuse a deleted file's creation timestamp for a same-named file created
+  shortly afterward (on the order of seconds). If that happens *and* the
+  replacement file happens to be exactly the same byte length as the file
+  it replaced at the moment `logtail` checks, rotation could be missed.
+  This is a real, documented limitation of doing rotation detection
+  without `unsafe`/unstable APIs on Windows - not a silently assumed-away
+  one.
+
+Truncation-in-place (`copytruncate`-style rotation, where the same file is
+emptied rather than replaced) is detected on every platform by noticing the
+file has gotten shorter than the offset already read, and does not depend
+on either of the above.
 
 ## Installation
 
@@ -289,7 +331,12 @@ tests (`tests/query_tests.rs`, `tests/streaming_tests.rs`,
 - Malformed JSON lines skipped with a counter, not aborting the stream.
 - The cardinality guard truncating and reporting an overflow count.
 - Follow-mode rotation (file replaced) and in-place truncation
-  (copytruncate-style).
+  (copytruncate-style); these run on every platform in CI. There is also a
+  Windows-only regression test (`windows_file_identity_is_stable_across_appends`
+  in `src/follow.rs`) that only executes in CI's `windows-latest` job -
+  see [Follow mode and log rotation](#follow-mode-and-log-rotation) for why
+  the Windows rotation-detection path needs platform-specific coverage and
+  what its known limitation is.
 - A 300,000-line generated log proving the pipeline stays correct (and its
   memory-bounded structures stay within their configured capacity)
   end-to-end.

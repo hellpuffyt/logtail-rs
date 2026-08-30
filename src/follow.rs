@@ -1,7 +1,46 @@
 //! Follow mode (`-f`): tails a file for new lines, detecting log rotation
-//! (the file at `path` being replaced by a new inode/file, as `logrotate`
-//! or similar tools do) so that following does not silently go stale the
-//! way plain `tail -f` can.
+//! (the file at `path` being replaced by a new file, as `logrotate` or
+//! similar tools do) so that following does not silently go stale the way
+//! plain `tail -f` can.
+//!
+//! # Platform differences in rotation detection
+//!
+//! On Unix, [`file_identity`] returns the file's inode number
+//! (`MetadataExt::ino`), which is the textbook way to notice "the path now
+//! refers to a different file": rename-based rotation (moving the old file
+//! aside and creating a new one at the same path) always changes it.
+//!
+//! On Windows there is no stable-Rust equivalent of an inode.
+//! `MetadataExt::file_index` exists but sits behind the unstable
+//! `windows_by_handle` feature and does not compile on stable Rust; getting
+//! the real NTFS file ID would require an `unsafe` FFI call into
+//! `GetFileInformationByHandle`, which this crate forbids
+//! (`unsafe_code = "forbid"`). Instead, [`file_identity`] on Windows uses
+//! the file's creation timestamp (`Metadata::created`, stable and safe):
+//! appending to a file does not change it, but replacing the file at a path
+//! (logrotate-style rename-and-recreate) normally does. Combined with the
+//! existing "file got shorter" check (which independently catches
+//! copytruncate-style rotation on every platform), this catches the same
+//! rotation patterns the Unix path does in the common case.
+//!
+//! [`Follower::poll`] backs the creation-time check with a second,
+//! platform-independent signal (see `reopen_if_rotated`): an already-open
+//! handle keeps reporting the size of whatever file it actually refers to,
+//! even after the path has been repointed at a different file, while a
+//! fresh stat of the path sees the new file. A mismatch there means the
+//! path no longer refers to the file the handle was opened against,
+//! independent of the identity check. That catches rename-based rotation
+//! on Windows even when creation-time tunnelling defeats the primary
+//! check, as long as the old and new files do not happen to be exactly the
+//! same length at the moment of the check.
+//!
+//! The known gap: if NTFS tunnelling preserves the creation timestamp *and*
+//! the replacement file happens to have the exact same byte length as the
+//! file it replaced at the moment `poll` runs, rotation could be missed.
+//! This is a real limitation of doing rotation detection without
+//! `unsafe`/unstable APIs on Windows, documented here rather than silently
+//! assumed away; see the platform-specific test below for what is actually
+//! exercised.
 
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
@@ -14,9 +53,16 @@ fn file_identity(meta: &fs::Metadata) -> u64 {
 }
 
 #[cfg(windows)]
+#[allow(clippy::cast_possible_truncation)]
 fn file_identity(meta: &fs::Metadata) -> u64 {
-    use std::os::windows::fs::MetadataExt;
-    meta.file_index().unwrap_or(0)
+    // No `unsafe`, no unstable features: derive a rotation-detection token
+    // from the (stable, safe) creation timestamp rather than a true file
+    // identifier. See the module-level docs for what this can and cannot
+    // detect.
+    meta.created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos() as u64)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -107,7 +153,26 @@ impl Follower {
             return;
         };
         let disk_identity = file_identity(&disk_meta);
-        if disk_identity != self.identity {
+        let identity_changed = disk_identity != self.identity;
+
+        // Second, platform-independent signal: an already-open handle keeps
+        // reporting the size of whatever file it actually refers to, even
+        // after the path has been repointed at a different file (renamed
+        // away and recreated). A fresh stat of the path, by contrast, sees
+        // the new file. If those disagree, the path no longer refers to the
+        // file this handle was opened against - regardless of whether the
+        // identity check above could tell. This is what keeps rotation
+        // detection working on Windows even in the case described in the
+        // module docs, where NTFS tunnelling can make a recreated file's
+        // creation time look unchanged: the two files still need to
+        // coincidentally share a byte length for that gap to bite in
+        // practice.
+        let size_diverged = self
+            .file
+            .metadata()
+            .is_ok_and(|handle_meta| handle_meta.len() != disk_meta.len());
+
+        if identity_changed || size_diverged {
             if let Ok(new_file) = File::open(&self.path) {
                 if let Ok(new_meta) = new_file.metadata() {
                     self.file = new_file;
@@ -186,6 +251,37 @@ mod tests {
 
         let lines = follower.poll().unwrap();
         assert_eq!(lines, vec!["fresh-1"]);
+    }
+
+    // Windows-only regression test for `file_identity`. It cannot be
+    // expressed portably: on Unix `file_identity` reads the inode, which
+    // this test has no reason to doubt, while the Windows implementation is
+    // the one this whole module is being careful about, so it gets its own
+    // targeted assertion rather than only being exercised indirectly by
+    // `detects_rotation_by_replacing_the_file` above. It only runs in CI's
+    // `windows-latest` job; it has not been run against a real Windows
+    // machine as part of this change. It cannot exercise the NTFS
+    // tunnelling gap documented at the top of this module - reliably
+    // triggering tunnelling would require deleting and recreating a file
+    // within its cache window and is not something this test controls.
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_identity_is_stable_across_appends() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        fs::write(&path, "one\n").unwrap();
+        let id_before = file_identity(&fs::metadata(&path).unwrap());
+
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "two").unwrap();
+        f.flush().unwrap();
+
+        let id_after = file_identity(&fs::metadata(&path).unwrap());
+
+        // Appending must not change the identity token: if it did, every
+        // poll would look like a rotation and Follower would re-read the
+        // whole file (and re-emit already-seen lines) on every call.
+        assert_eq!(id_before, id_after);
     }
 
     #[test]

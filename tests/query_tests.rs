@@ -258,3 +258,10 @@ fn invalid_regex_pattern_returns_error_not_panic() {
     let cache = RegexCache::default();
     assert!(eval(&expr, &json!({"path": "/api"}), &cache).is_err());
 }
+
+#[test]
+fn validate_regexes_finds_invalid_patterns_anywhere_in_the_tree() {
+    use logtail::query::validate_regexes;
+    assert!(validate_regexes(&parse(r#"a == 1 or not (b ~ "(")"#).unwrap()).is_err());
+    assert!(validate_regexes(&parse(r#"a == 1 and b ~ "^ok$""#).unwrap()).is_ok());
+}

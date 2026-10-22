@@ -8,6 +8,7 @@
 pub mod agg;
 pub mod cardinality;
 pub mod follow;
+pub mod lines;
 pub mod output;
 pub mod query;
 pub mod record;

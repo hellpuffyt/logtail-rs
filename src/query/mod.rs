@@ -6,7 +6,7 @@ pub mod lexer;
 pub mod parser;
 
 pub use ast::Expr;
-pub use eval::{eval, RegexCache};
+pub use eval::{eval, validate_regexes, RegexCache};
 pub use parser::{ParseError, Parser};
 
 /// Parses a query string into an [`Expr`]. Convenience wrapper around

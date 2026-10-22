@@ -7,13 +7,14 @@
 use clap::Parser as ClapParser;
 use logtail::agg::{AggKind, Aggregator};
 use logtail::follow::Follower;
+use logtail::lines::{Line, LineReader, DEFAULT_MAX_LINE_BYTES};
 use logtail::output::{render_aggregation, render_record, OutputFormat};
 use logtail::query::{self, eval, Expr, RegexCache};
 use logtail::record::{parse_line, ParsedLine};
 use logtail::window::{extract_timestamp, parse_time_arg, TimeRange, TumblingWindow};
 use serde_json::Value;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufReader, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
@@ -84,6 +85,11 @@ struct Cli {
     /// accurate, more memory).
     #[arg(long, default_value_t = DEFAULT_RESERVOIR_CAPACITY)]
     reservoir_capacity: usize,
+
+    /// Longest line, in bytes, that is parsed; longer lines are skipped
+    /// (and counted) without being held in memory.
+    #[arg(long, default_value_t = DEFAULT_MAX_LINE_BYTES)]
+    max_line_bytes: usize,
 }
 
 struct RunConfig {
@@ -113,6 +119,8 @@ fn main() -> ExitCode {
 fn build_config(cli: &Cli) -> Result<RunConfig, String> {
     let expr = query::parse(cli.query.as_deref().unwrap_or(""))
         .map_err(|e| format!("query error at {e}"))?;
+    query::validate_regexes(&expr)
+        .map_err(|(pattern, e)| format!("query error: invalid regex `{pattern}`: {e}"))?;
 
     let mut agg_kinds = Vec::new();
     for spec in &cli.agg {
@@ -238,13 +246,34 @@ fn run(cli: &Cli) -> Result<(), String> {
         Ok(())
     };
 
+    // Lines that were not valid UTF-8 count as malformed; over-long lines
+    // are counted separately so the cap is visible to the user.
+    let mut too_long = 0u64;
+    let mut handle = |line: Line,
+                      aggregator: &mut Aggregator,
+                      out: &mut dyn Write,
+                      malformed: &mut u64,
+                      matched: &mut u64|
+     -> Result<(), String> {
+        match line {
+            Line::Text(text) => process_line(&text, aggregator, out, malformed, matched),
+            Line::InvalidUtf8 => {
+                *malformed += 1;
+                Ok(())
+            }
+            Line::TooLong => {
+                too_long += 1;
+                Ok(())
+            }
+        }
+    };
+
     if let Some(path) = &cli.file {
         let file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            let line = line.map_err(|e| e.to_string())?;
-            process_line(
-                &line,
+        let mut reader = LineReader::new(BufReader::new(file), cli.max_line_bytes);
+        while let Some(read) = reader.next_line().map_err(|e| e.to_string())? {
+            handle(
+                read.line,
                 &mut aggregator,
                 &mut out,
                 &mut malformed,
@@ -254,16 +283,17 @@ fn run(cli: &Cli) -> Result<(), String> {
 
         if config.follow {
             let mut follower = Follower::open_at_end(path)
-                .map_err(|e| format!("cannot follow {}: {e}", path.display()))?;
+                .map_err(|e| format!("cannot follow {}: {e}", path.display()))?
+                .with_max_line_bytes(cli.max_line_bytes);
             loop {
-                let lines = follower.poll().map_err(|e| e.to_string())?;
+                let lines = follower.poll_lines().map_err(|e| e.to_string())?;
                 if lines.is_empty() {
                     std::thread::sleep(FOLLOW_POLL_INTERVAL);
                     continue;
                 }
                 for line in lines {
-                    process_line(
-                        &line,
+                    handle(
+                        line,
                         &mut aggregator,
                         &mut out,
                         &mut malformed,
@@ -279,17 +309,10 @@ fn run(cli: &Cli) -> Result<(), String> {
         }
     } else {
         let stdin = io::stdin();
-        let mut reader = BufReader::new(stdin.lock());
-        let mut buf = String::new();
-        loop {
-            buf.clear();
-            let n = reader.read_line(&mut buf).map_err(|e| e.to_string())?;
-            if n == 0 {
-                break;
-            }
-            let line = buf.trim_end_matches(['\r', '\n']);
-            process_line(
-                line,
+        let mut reader = LineReader::new(BufReader::new(stdin.lock()), cli.max_line_bytes);
+        while let Some(read) = reader.next_line().map_err(|e| e.to_string())? {
+            handle(
+                read.line,
                 &mut aggregator,
                 &mut out,
                 &mut malformed,
@@ -305,6 +328,12 @@ fn run(cli: &Cli) -> Result<(), String> {
 
     if malformed > 0 {
         eprintln!("logtail: skipped {malformed} malformed line(s)");
+    }
+    if too_long > 0 {
+        eprintln!(
+            "logtail: skipped {too_long} line(s) longer than --max-line-bytes ({})",
+            cli.max_line_bytes
+        );
     }
     let _ = matched;
     Ok(())

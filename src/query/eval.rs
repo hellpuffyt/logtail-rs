@@ -80,6 +80,26 @@ impl RegexCache {
     }
 }
 
+/// Compiles every `~` pattern in `expr` once, so an invalid regex is
+/// reported before any input is read rather than when (or if) the first
+/// record happens to reach that branch of the query.
+///
+/// # Errors
+/// Returns the first pattern that fails to compile, with the compile error.
+pub fn validate_regexes(expr: &Expr) -> Result<(), (String, regex::Error)> {
+    match expr {
+        Expr::Match { pattern, .. } => Regex::new(pattern)
+            .map(|_| ())
+            .map_err(|e| (pattern.clone(), e)),
+        Expr::Not(inner) => validate_regexes(inner),
+        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
+            validate_regexes(lhs)?;
+            validate_regexes(rhs)
+        }
+        Expr::Compare { .. } | Expr::Contains { .. } | Expr::Has { .. } | Expr::True => Ok(()),
+    }
+}
+
 /// Evaluates `expr` against `record`, using `cache` to avoid recompiling
 /// regex patterns for `~` matches on every call.
 ///

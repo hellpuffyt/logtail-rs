@@ -237,7 +237,7 @@ mod tests {
         fs::write(&path, "old line\n").unwrap();
 
         let mut follower = Follower::open_at_end(&path).unwrap();
-        assert!(follower.poll().unwrap().is_empty());
+        assert_eq!(follower.poll().unwrap(), [] as [std::string::String; 0]);
 
         let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
         writeln!(f, "new line 1").unwrap();
@@ -277,7 +277,7 @@ mod tests {
         let path = dir.path().join("app.log");
         fs::write(&path, "old-1\nold-2\n").unwrap();
         let mut follower = Follower::open_at_end(&path).unwrap();
-        assert!(follower.poll().unwrap().is_empty());
+        assert_eq!(follower.poll().unwrap(), [] as [std::string::String; 0]);
 
         // Simulate logrotate: move the old file aside, create a fresh one
         // at the same path.
@@ -361,7 +361,7 @@ mod tests {
         writeln!(f, "one").unwrap();
         f.flush().unwrap();
         assert_eq!(follower.poll().unwrap(), vec!["one"]);
-        assert!(follower.poll().unwrap().is_empty());
+        assert_eq!(follower.poll().unwrap(), [] as [std::string::String; 0]);
 
         writeln!(f, "two").unwrap();
         f.flush().unwrap();

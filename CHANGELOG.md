@@ -5,6 +5,38 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A single line that was not valid UTF-8 aborted the whole run ("stream
+  did not contain valid UTF-8"), for files, stdin and follow mode. Such
+  lines are now skipped and counted as malformed.
+- Lines were buffered whole, so memory grew with the longest line (a
+  200 MiB line used ~426 MB RSS). Lines longer than the new
+  `--max-line-bytes` (default 1 MiB) are now skipped and counted without
+  being held in memory (~5.5 MB RSS for the same input).
+- Follow mode collected everything appended between polls into memory at
+  once; it now hands data over in batches of at most 8 MiB.
+- An invalid `~` regex was only compiled when a record reached it: queries
+  whose regex branch never ran exited 0 having matched nothing, others
+  failed after partial output. Regexes are now validated before reading.
+- Numeric timestamps far outside `SystemTime`'s range could panic on
+  platforms with a narrower range; they are now treated as missing.
+- `cargo doc` failed under `-D warnings` (links to a private item).
+
+### Changed
+
+- README: follow mode is `-F` (`-f` is `--format`); the follow example
+  used `-f` and did not run. Performance numbers re-measured on the audit
+  host with the commands shown. Added `--max-line-bytes` to the usage.
+
+### Added
+
+- `--max-line-bytes`, `logtail::lines::LineReader`,
+  `Follower::poll_lines`, `query::validate_regexes`.
+- `SECURITY.md`, `.editorconfig`, `docs/PRODUCTION_READINESS.md`.
+
 ## [0.1.0] - 2026-08-30
 
 ### Added

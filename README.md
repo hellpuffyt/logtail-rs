@@ -16,13 +16,17 @@ line - and lets you:
   by one or more fields.
 - Restrict to a time range (`--since`/`--until`) or bucket into tumbling
   time windows (`--window`) for a time series.
-- Follow a live file (`-f`/`--follow`) the way `tail -f` does, but survive
+- Follow a live file (`-F`/`--follow`) the way `tail -f` does, but survive
   the file being rotated out from under it.
 - Emit a table for a terminal, or JSON/NDJSON for piping into another tool.
 
 Everything is streaming: `logtail` reads one line at a time and never loads
 the whole file into memory, regardless of file size (see
-[Performance](#performance) for a measured 370 MB / 3,000,000-line run).
+[Performance](#performance) for a measured 402 MB / 3,000,000-line run).
+Per-line memory is capped too: a line longer than `--max-line-bytes`
+(default 1 MiB) is skipped and counted without being buffered, and a line
+that is not valid UTF-8 is skipped and counted as malformed instead of
+aborting the run.
 
 ## Why
 
@@ -183,7 +187,7 @@ collection of records.
 
 ## Follow mode and log rotation
 
-`-f`/`--follow` needs to notice when the file at `path` has been *replaced*
+`-F`/`--follow` needs to notice when the file at `path` has been *replaced*
 (logrotate-style: move the old file aside, create a new one at the same
 name) rather than just appended to, or it would silently keep reading from
 the old, now-disconnected file - the classic way `tail -f` goes stale.
@@ -251,7 +255,11 @@ logtail [FILE] [OPTIONS]
   -F, --follow             Follow the file for new lines, handling rotation.
       --cardinality-limit <N>    Max distinct group-by keys (default: 10000).
       --reservoir-capacity <N>   Percentile sample size (default: 10000).
+      --max-line-bytes <N>       Longest line parsed; longer lines are skipped
+                                 and counted (default: 1048576).
 ```
+
+Note the case: `-f` is `--format`, `-F` is `--follow`.
 
 ## Examples
 
@@ -277,7 +285,7 @@ logtail app.log --query 'http.request.path ~ "^/api/v[0-9]+/" and has error'
 Live-tail error rate by service, surviving log rotation:
 
 ```sh
-logtail /var/log/app/current.log -f --query 'status >= 500' \
+logtail /var/log/app/current.log -F --query 'status >= 500' \
   --agg count --group-by service
 ```
 
@@ -295,22 +303,25 @@ logtail app.log --window 1m --agg count --format json
 
 ## Performance
 
-Measured with the release binary (`cargo build --release`) in the same
-`rust:1` Debian container used for CI, on a synthetic **370 MB, 3,000,000
-line** NDJSON log (six fields per record, realistic field-value
-cardinality):
+Measured on an Apple M5 (10 cores, 16 GB, macOS 27.0.1), rustc 1.98.0,
+release profile (`cargo build --release`), against a generated **402 MB,
+3,000,000-line** NDJSON log (seven fields per record: timestamp, service,
+status, path, latency, request id). Three runs each; the table shows the
+median wall-clock time from `/usr/bin/time -l`, output sent to `/dev/null`:
 
-| Query | Time | Throughput |
-| --- | ---: | ---: |
-| `--query 'status >= 500 and not path contains "/health"'` (raw filter → NDJSON) | 1.34 s | ~276 MB/s, ~2.24M lines/s |
-| `--agg 'count,avg(latency_ms),p50/p90/p99(latency_ms)' --group-by service,status` (36 groups) | 1.78 s | ~208 MB/s, ~1.68M lines/s |
+| Query | Time | Throughput | Max RSS |
+| --- | ---: | ---: | ---: |
+| `--query 'status >= 500 and not path contains "/health"' --format ndjson` | 2.35 s | ~171 MB/s, ~1.28M lines/s | 2.9 MB |
+| `--agg 'count,avg(latency_ms),p50(latency_ms),p90(latency_ms),p99(latency_ms)' --group-by service,status` (42 groups) | 3.22 s | ~125 MB/s, ~0.93M lines/s | 10.1 MB |
 
-These are single-run wall-clock numbers on shared CI-class hardware, not a
-tuned benchmark harness - treat them as an order-of-magnitude indication,
-not a guarantee. Memory use is independent of file size: the streaming
+These are single-machine numbers, not a tuned benchmark harness - treat
+them as an order-of-magnitude indication. The generator is a short script
+(random service/status/path/latency values, fixed seed); it is not shipped
+in the repository. Memory use is independent of file size: the streaming
 tests (`tests/streaming_tests.rs`) exercise a 300,000-line generated log to
 confirm the reservoir and cardinality-guard structures stay within their
-configured bounds regardless of how much data flows through them.
+configured bounds, and a 200 MiB single-line file is processed in ~5.5 MB
+RSS because the over-long line is skipped rather than buffered.
 
 ## Testing
 
@@ -318,7 +329,7 @@ configured bounds regardless of how much data flows through them.
 cargo test --all-targets
 ```
 
-85 tests across unit tests (co-located with each module) and integration
+98 tests (0 ignored) across unit tests (co-located with each module) and integration
 tests (`tests/query_tests.rs`, `tests/streaming_tests.rs`,
 `tests/cli_tests.rs`), covering:
 
@@ -328,7 +339,10 @@ tests (`tests/query_tests.rs`, `tests/streaming_tests.rs`,
 - Aggregations against hand-computed expected values, including percentile
   edge cases (empty, single element, all-identical, even/odd counts,
   values beyond reservoir capacity).
-- Malformed JSON lines skipped with a counter, not aborting the stream.
+- Malformed JSON lines, non-UTF-8 lines and lines over `--max-line-bytes`
+  skipped with a counter, not aborting the stream (file, stdin and follow
+  mode).
+- Invalid `~` regexes rejected before any input is read.
 - The cardinality guard truncating and reporting an overflow count.
 - Follow-mode rotation (file replaced) and in-place truncation
   (copytruncate-style); these run on every platform in CI. There is also a
@@ -359,8 +373,11 @@ tests (`tests/query_tests.rs`, `tests/streaming_tests.rs`,
   `regex`, `thiserror`, `humantime`) to keep the audit surface and the MSRV
   small.
 
-Found a security issue? Please open an issue describing it; there is no
-dedicated security contact for this project yet.
+- Per-line memory is bounded by `--max-line-bytes`; follow mode hands over
+  appended data in bounded batches.
+
+Found a security issue? Please report it privately as described in
+[SECURITY.md](SECURITY.md) rather than opening a public issue.
 
 ## MSRV
 

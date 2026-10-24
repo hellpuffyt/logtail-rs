@@ -1,11 +1,11 @@
-//! Follow mode (`-f`): tails a file for new lines, detecting log rotation
+//! Follow mode (`-F`/`--follow`): tails a file for new lines, detecting log rotation
 //! (the file at `path` being replaced by a new file, as `logrotate` or
 //! similar tools do) so that following does not silently go stale the way
 //! plain `tail -f` can.
 //!
 //! # Platform differences in rotation detection
 //!
-//! On Unix, [`file_identity`] returns the file's inode number
+//! On Unix, `file_identity` returns the file's inode number
 //! (`MetadataExt::ino`), which is the textbook way to notice "the path now
 //! refers to a different file": rename-based rotation (moving the old file
 //! aside and creating a new one at the same path) always changes it.
@@ -15,7 +15,7 @@
 //! `windows_by_handle` feature and does not compile on stable Rust; getting
 //! the real NTFS file ID would require an `unsafe` FFI call into
 //! `GetFileInformationByHandle`, which this crate forbids
-//! (`unsafe_code = "forbid"`). Instead, [`file_identity`] on Windows uses
+//! (`unsafe_code = "forbid"`). Instead, `file_identity` on Windows uses
 //! the file's creation timestamp (`Metadata::created`, stable and safe):
 //! appending to a file does not change it, but replacing the file at a path
 //! (logrotate-style rename-and-recreate) normally does. Combined with the
@@ -43,8 +43,15 @@
 //! exercised.
 
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
+use std::io::{self, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+
+use crate::lines::{Line, LineReader, DEFAULT_MAX_LINE_BYTES};
+
+/// How many bytes one [`Follower::poll_lines`] call consumes at most
+/// (always at least one whole line), so a large burst of appended data is
+/// handed over in bounded batches rather than collected into memory at once.
+pub const POLL_BYTE_BUDGET: u64 = 8 * 1024 * 1024;
 
 #[cfg(unix)]
 fn file_identity(meta: &fs::Metadata) -> u64 {
@@ -78,6 +85,7 @@ pub struct Follower {
     file: File,
     identity: u64,
     offset: u64,
+    max_line_bytes: usize,
 }
 
 impl Follower {
@@ -107,17 +115,48 @@ impl Follower {
             file,
             identity: file_identity(&meta),
             offset,
+            max_line_bytes: DEFAULT_MAX_LINE_BYTES,
         })
     }
 
+    /// Sets the most bytes kept from any one line; longer lines are
+    /// skipped and reported as [`Line::TooLong`] by [`Follower::poll_lines`].
+    #[must_use]
+    pub fn with_max_line_bytes(mut self, max_line_bytes: usize) -> Self {
+        self.max_line_bytes = max_line_bytes;
+        self
+    }
+
     /// Checks for rotation/truncation and returns any newly available
-    /// complete lines since the last call. A trailing partial line (no
-    /// terminating `\n` yet) is left unconsumed for the next poll.
+    /// complete, valid UTF-8 lines since the last call. A trailing partial
+    /// line (no terminating `\n` yet) is left unconsumed for the next poll.
+    /// Lines that are not valid UTF-8 or exceed the line-length cap are
+    /// dropped; use [`Follower::poll_lines`] to see them.
     ///
     /// # Errors
     /// Returns an error if a filesystem operation fails. A momentarily
     /// missing file (mid-rotation) is tolerated and simply yields no lines.
     pub fn poll(&mut self) -> io::Result<Vec<String>> {
+        Ok(self
+            .poll_lines()?
+            .into_iter()
+            .filter_map(|line| match line {
+                Line::Text(s) => Some(s),
+                Line::InvalidUtf8 | Line::TooLong => None,
+            })
+            .collect())
+    }
+
+    /// Like [`Follower::poll`], but also reports invalid-UTF-8 and
+    /// over-long lines, and consumes at most [`POLL_BYTE_BUDGET`] bytes per
+    /// call (call again immediately if it returned lines).
+    ///
+    /// Memory is bounded by the line cap and the byte budget, never by the
+    /// size of what was appended.
+    ///
+    /// # Errors
+    /// As [`Follower::poll`].
+    pub fn poll_lines(&mut self) -> io::Result<Vec<Line>> {
         self.reopen_if_rotated();
 
         let len = self.file.metadata()?.len();
@@ -128,21 +167,19 @@ impl Follower {
 
         self.file.seek(SeekFrom::Start(self.offset))?;
         let mut lines = Vec::new();
-        let mut reader = BufReader::new(&self.file);
-        loop {
-            let mut buf = String::new();
-            let n = reader.read_line(&mut buf)?;
-            if n == 0 {
+        let mut reader = LineReader::new(BufReader::new(&self.file), self.max_line_bytes);
+        let mut consumed_this_poll = 0u64;
+        while consumed_this_poll < POLL_BYTE_BUDGET {
+            let Some(read) = reader.next_line()? else {
                 break;
-            }
-            if buf.ends_with('\n') {
-                self.offset += n as u64;
-                let trimmed = buf.trim_end_matches(['\r', '\n']).to_string();
-                lines.push(trimmed);
-            } else {
+            };
+            if !read.terminated {
                 // Partial line; wait for more data before consuming it.
                 break;
             }
+            self.offset += read.consumed;
+            consumed_this_poll += read.consumed;
+            lines.push(read.line);
         }
         Ok(lines)
     }
@@ -200,7 +237,7 @@ mod tests {
         fs::write(&path, "old line\n").unwrap();
 
         let mut follower = Follower::open_at_end(&path).unwrap();
-        assert!(follower.poll().unwrap().is_empty());
+        assert_eq!(follower.poll().unwrap(), [] as [std::string::String; 0]);
 
         let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
         writeln!(f, "new line 1").unwrap();
@@ -240,7 +277,7 @@ mod tests {
         let path = dir.path().join("app.log");
         fs::write(&path, "old-1\nold-2\n").unwrap();
         let mut follower = Follower::open_at_end(&path).unwrap();
-        assert!(follower.poll().unwrap().is_empty());
+        assert_eq!(follower.poll().unwrap(), [] as [std::string::String; 0]);
 
         // Simulate logrotate: move the old file aside, create a fresh one
         // at the same path.
@@ -324,10 +361,63 @@ mod tests {
         writeln!(f, "one").unwrap();
         f.flush().unwrap();
         assert_eq!(follower.poll().unwrap(), vec!["one"]);
-        assert!(follower.poll().unwrap().is_empty());
+        assert_eq!(follower.poll().unwrap(), [] as [std::string::String; 0]);
 
         writeln!(f, "two").unwrap();
         f.flush().unwrap();
         assert_eq!(follower.poll().unwrap(), vec!["two"]);
+    }
+
+    #[test]
+    fn poll_lines_reports_invalid_utf8_and_over_long_lines() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        fs::write(&path, "").unwrap();
+        let mut follower = Follower::open_at_end(&path)
+            .unwrap()
+            .with_max_line_bytes(16);
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"ok\n\xff\xfe\n").unwrap();
+        f.write_all(&[b'x'; 100]).unwrap();
+        f.write_all(b"\nafter\n").unwrap();
+        f.flush().unwrap();
+        let lines = follower.poll_lines().unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                Line::Text("ok".into()),
+                Line::InvalidUtf8,
+                Line::TooLong,
+                Line::Text("after".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn poll_lines_hands_over_large_appends_in_bounded_batches() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        fs::write(&path, "").unwrap();
+        let mut follower = Follower::open_at_end(&path).unwrap();
+        let line = format!("{}\n", "z".repeat(1023));
+        let total_lines = usize::try_from(POLL_BYTE_BUDGET / 1024).unwrap() * 3;
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        for _ in 0..total_lines {
+            f.write_all(line.as_bytes()).unwrap();
+        }
+        f.flush().unwrap();
+        let mut batches = 0;
+        let mut seen = 0;
+        loop {
+            let lines = follower.poll_lines().unwrap();
+            if lines.is_empty() {
+                break;
+            }
+            assert!(lines.len() * 1024 <= usize::try_from(POLL_BYTE_BUDGET).unwrap());
+            seen += lines.len();
+            batches += 1;
+        }
+        assert_eq!(seen, total_lines);
+        assert_eq!(batches, 3);
     }
 }

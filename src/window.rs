@@ -49,9 +49,11 @@ pub fn extract_timestamp(record: &Value, field: &str) -> Option<SystemTime> {
                 // looks like milliseconds
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let millis = f.max(0.0) as u64;
-                Some(UNIX_EPOCH + Duration::from_millis(millis))
+                // checked: an absurd timestamp must be "no timestamp", not
+                // a panic (SystemTime's range is platform-dependent).
+                UNIX_EPOCH.checked_add(Duration::from_millis(millis))
             } else {
-                Some(UNIX_EPOCH + Duration::from_secs_f64(f.max(0.0)))
+                UNIX_EPOCH.checked_add(Duration::from_secs_f64(f.max(0.0)))
             }
         }
         _ => None,

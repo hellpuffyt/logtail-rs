@@ -4,10 +4,13 @@ Filter and aggregate high-volume structured JSON logs with a real query
 language, streaming throughout so a multi-gigabyte file never has to fit in
 memory.
 
+**Status:** version 0.1.0. A single-binary CLI built from source; it is not
+published to crates.io. 98 tests pass on Linux, macOS and Windows in CI.
+
 ## What
 
-`logtail` reads newline-delimited JSON (NDJSON) logs - one JSON object per
-line - and lets you:
+`logtail` reads newline-delimited JSON (NDJSON) logs, one JSON object per
+line, and lets you:
 
 - Filter records with a small expression language (`status >= 500 and not
   path contains "/health"`).
@@ -39,6 +42,57 @@ slow to set up and not free, and often the log file you need is already
 sitting right there on disk or scrolling past in a live tail. `logtail` is
 the tool for that: a real query language and real aggregations, running
 locally, streaming, with bounded memory.
+
+## Demo
+
+<img src="docs/screenshots/logtail-aggregate-filter-window.png" width="100%" alt="Terminal capture of four logtail runs against a six-line sample log: a grouped aggregation table, a filter query printing one matching record, a one-minute window count, and a positioned query error.">
+
+Real output from the release build against the six-line `app.log` below
+(one line is deliberately not JSON, which is why every run reports a skipped
+line on stderr). After [building](#installation), create the file and run:
+
+```sh
+cat > app.log <<'EOF'
+{"timestamp":"2026-10-26T10:00:05Z","service":"api","status":200,"path":"/api/v1/items","latency_ms":42}
+{"timestamp":"2026-10-26T10:00:20Z","service":"api","status":503,"path":"/api/v1/orders","latency_ms":910,"error":"upstream timeout"}
+{"timestamp":"2026-10-26T10:00:40Z","service":"api","status":500,"path":"/health","latency_ms":3}
+{"timestamp":"2026-10-26T10:01:10Z","service":"auth","status":200,"path":"/login","latency_ms":120}
+{"timestamp":"2026-10-26T10:01:30Z","service":"auth","status":401,"path":"/login","latency_ms":95}
+not json at all
+EOF
+./target/release/logtail app.log --agg 'count,p50(latency_ms),max(latency_ms)' --group-by service
+```
+
+```text
+service  count  p50(latency_ms)  max(latency_ms)
+-------  -----  ---------------  ---------------
+api      3      42               910
+auth     2      120              120
+
+logtail: skipped 1 malformed line(s)
+```
+
+```sh
+./target/release/logtail app.log --query 'status >= 500 and not path contains "/health"'
+```
+
+```text
+{"error":"upstream timeout","latency_ms":910,"path":"/api/v1/orders","service":"api","status":503,"timestamp":"2026-10-26T10:00:20Z"}
+logtail: skipped 1 malformed line(s)
+```
+
+```sh
+./target/release/logtail app.log --window 1m --agg count
+```
+
+```text
+_window_start  count
+-------------  -----
+1793008800     3
+1793008860     2
+
+logtail: skipped 1 malformed line(s)
+```
 
 ## Query language reference
 
@@ -85,13 +139,13 @@ the field is treated as absent.
 
 ### Null and type-mismatch handling
 
-A missing field never matches a comparison (except `field != null`, which is
-true for both "present and non-null" and treated as false for "missing" -
-matching the intuition that a query about a field's *value* shouldn't fire
-on a record that never had the field). Comparing values of mismatched JSON
-types (e.g. `status == "200"` against a numeric `status` field) evaluates to
-`false` rather than raising an error - this is a query language for
-heterogeneous real-world logs, not a type-checked language.
+A comparison against a missing field is always false, `!=` included: for
+the records `{"a":1}`, `{"a":null}` and `{"b":2}`, `a != null` matches only
+the first, and `a != 5` also matches only the first. Comparing mismatched
+JSON types (`status == "200"` against a numeric `status`, or `a != 5` when
+`a` is `null`) is false rather than an error, because real logs are
+heterogeneous. To include records that lack the field, negate the whole
+comparison: `not a == 1` matches the second and third records.
 
 ### Errors
 
@@ -140,15 +194,19 @@ URL with a query string) would otherwise grow the group table without
 bound. `logtail` caps the number of distinct groups at
 `--cardinality-limit` (default 10,000); once the cap is hit, further new
 keys are folded into a single overflow bucket and a warning is printed
-reporting how many additional values were folded in - rather than the
+reporting how many additional values were folded in, rather than the
 process silently consuming unbounded memory.
 
 ## Architecture
 
+<img src="docs/assets/overview.svg" width="100%" alt="Diagram of the logtail pipeline: lines from a file, stdin or a followed file go through LineReader, record parsing, the --since/--until filter and the query evaluator, then are either printed or folded into the Aggregator (CardinalityGuard, GroupState, ReservoirSampler) and rendered.">
+
+*Diagram of the per-line pipeline, drawn from the modules in `src/`.*
+
 ```text
   file/stdin              lexer/parser        evaluator
  ───────────►  raw line ──────────────► Expr ──────────► bool ─┐
-  (BufReader,               (query.rs)        (query::eval)    │ matched
+  (LineReader,              (query/)          (query::eval)    │ matched
    line at a time)                                              │
                                                                   ▼
                                               ┌── raw record ──► output (table/json/ndjson)
@@ -163,6 +221,9 @@ process silently consuming unbounded memory.
 
 Key modules (`src/`):
 
+- `lines.rs` - `LineReader`, which reads one line at a time, skips lines
+  longer than `--max-line-bytes` without buffering them, and flags
+  non-UTF-8 lines.
 - `query/{lexer,parser,ast,eval}.rs` - the query language: hand-written
   recursive-descent parser producing an `Expr` tree, evaluated directly
   against `serde_json::Value` records (no compilation to bytecode; the tree
@@ -182,15 +243,15 @@ Key modules (`src/`):
 
 The whole pipeline is single-pass and streaming: `main.rs` reads one line,
 parses it, evaluates the query, and either emits it immediately (raw
-filter) or folds it into the aggregator - it is never buffered as a
-collection of records.
+filter) or folds it into the aggregator. Records are never buffered as a
+collection.
 
 ## Follow mode and log rotation
 
 `-F`/`--follow` needs to notice when the file at `path` has been *replaced*
 (logrotate-style: move the old file aside, create a new one at the same
 name) rather than just appended to, or it would silently keep reading from
-the old, now-disconnected file - the classic way `tail -f` goes stale.
+the old, now-disconnected file, which is the classic way `tail -f` goes stale.
 `logtail` detects this differently per platform, and it is worth being
 precise about what each approach can and cannot see:
 
@@ -220,6 +281,13 @@ precise about what each approach can and cannot see:
   without `unsafe`/unstable APIs on Windows - not a silently assumed-away
   one.
 
+What follow mode prints: `logtail` first reads the whole existing file,
+then polls every 300 ms for appended lines. Without `--agg`, each new match
+is printed as it arrives. With `--agg`, nothing is printed for the existing
+content; each time new lines arrive the full cumulative aggregation table is
+printed again, so the last table on screen is the running total. Stop it
+with Ctrl-C. `-F` only applies to a FILE argument; stdin is read to the end.
+
 Truncation-in-place (`copytruncate`-style rotation, where the same file is
 emptied rather than replaced) is detected on every platform by noticing the
 file has gotten shorter than the offset already read, and does not depend
@@ -227,7 +295,7 @@ on either of the above.
 
 ## Installation
 
-Build from source (requires Rust 1.85 or newer - see [MSRV](#msrv) below):
+Build from source (requires Rust 1.85 or newer, see [MSRV](#msrv) below):
 
 ```sh
 git clone https://github.com/hellpuffyt/logtail-rs.git
@@ -259,7 +327,31 @@ logtail [FILE] [OPTIONS]
                                  and counted (default: 1048576).
 ```
 
-Note the case: `-f` is `--format`, `-F` is `--follow`.
+Note the case: `-f` is `--format`, `-F` is `--follow`. `logtail --help`
+prints the full descriptions.
+
+### Timestamps
+
+`--since`, `--until` and `--window` read the field named by `--time-field`
+(default `timestamp`). It may be an RFC3339 string or a Unix epoch number in
+seconds; numbers above 10^12 are treated as milliseconds. When one of these
+options is set, records without a parseable timestamp are dropped. A
+relative `--since 5m` means five minutes before the current clock time.
+`--window` adds a `_window_start` column holding the bucket start in Unix
+seconds.
+
+### Output formats
+
+With `--agg`, `table` prints aligned columns, `json` prints one document
+(`{"rows": [...], "truncated": false, "truncated_count": 0}`) and `ndjson`
+prints one row object per line. Without `--agg`, matching records are
+printed one per line as compact JSON for both `table` and `ndjson`, and
+pretty-printed (one indented object after another, not a JSON array) for
+`json`. The count of skipped lines goes to stderr, so stdout stays clean
+for piping.
+
+Exit codes: 0 on success; 1 for a query error, an unreadable file or an
+invalid option value; 2 for an unknown flag (reported by clap).
 
 ## Examples
 
@@ -282,7 +374,8 @@ Regex match and nested field access:
 logtail app.log --query 'http.request.path ~ "^/api/v[0-9]+/" and has error'
 ```
 
-Live-tail error rate by service, surviving log rotation:
+Live-tail a running count of server errors by service, surviving log
+rotation (the table is reprinted whenever new lines arrive):
 
 ```sh
 logtail /var/log/app/current.log -F --query 'status >= 500' \
@@ -314,7 +407,7 @@ median wall-clock time from `/usr/bin/time -l`, output sent to `/dev/null`:
 | `--query 'status >= 500 and not path contains "/health"' --format ndjson` | 2.35 s | ~171 MB/s, ~1.28M lines/s | 2.9 MB |
 | `--agg 'count,avg(latency_ms),p50(latency_ms),p90(latency_ms),p99(latency_ms)' --group-by service,status` (42 groups) | 3.22 s | ~125 MB/s, ~0.93M lines/s | 10.1 MB |
 
-These are single-machine numbers, not a tuned benchmark harness - treat
+These are single-machine numbers, not a tuned benchmark harness. Treat
 them as an order-of-magnitude indication. The generator is a short script
 (random service/status/path/latency values, fixed seed); it is not shipped
 in the repository. Memory use is independent of file size: the streaming
@@ -347,7 +440,7 @@ tests (`tests/query_tests.rs`, `tests/streaming_tests.rs`,
 - Follow-mode rotation (file replaced) and in-place truncation
   (copytruncate-style); these run on every platform in CI. There is also a
   Windows-only regression test (`windows_file_identity_is_stable_across_appends`
-  in `src/follow.rs`) that only executes in CI's `windows-latest` job -
+  in `src/follow.rs`) that only executes in CI's `windows-latest` job;
   see [Follow mode and log rotation](#follow-mode-and-log-rotation) for why
   the Windows rotation-detection path needs platform-specific coverage and
   what its known limitation is.
@@ -357,10 +450,14 @@ tests (`tests/query_tests.rs`, `tests/streaming_tests.rs`,
 - CLI end-to-end behavior via the compiled binary (`assert_cmd`): filtering,
   aggregation, output formats, error reporting, and stdin input.
 
+CI (`.github/workflows/ci.yml`) also runs `cargo fmt --all -- --check`,
+`cargo clippy --all-targets -- -D warnings`, an MSRV build on Rust 1.85, and
+a release smoke test against a generated 5,000-line log.
+
 ## Security
 
-- `unsafe_code = "forbid"` at the crate level - there is no `unsafe` in this
-  codebase.
+- `unsafe_code = "forbid"` at the crate level, so there is no `unsafe` in
+  this codebase.
 - Input is treated as untrusted: malformed JSON lines are skipped with a
   counter rather than causing a panic or aborting the run; a JSON line that
   parses but isn't a top-level object is likewise treated as malformed.
@@ -372,7 +469,6 @@ tests (`tests/query_tests.rs`, `tests/streaming_tests.rs`,
 - Dependencies are kept intentionally minimal (`clap`, `serde`/`serde_json`,
   `regex`, `thiserror`, `humantime`) to keep the audit surface and the MSRV
   small.
-
 - Per-line memory is bounded by `--max-line-bytes`; follow mode hands over
   appended data in bounded batches.
 
@@ -383,11 +479,16 @@ Found a security issue? Please report it privately as described in
 
 Minimum supported Rust version: **1.85**, verified by building
 (`cargo build --all-targets`) and running the full test suite
-(`cargo test --all-targets`) against the `rust:1.85` Docker image - both
+(`cargo test --all-targets`) against the `rust:1.85` Docker image; both
 pass. Building against `rust:1.84` fails (a dependency requires the
 `edition2024` Cargo feature, stabilized in 1.85), which is why the MSRV is
 1.85 rather than lower; this is checked in CI's dedicated MSRV job.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Changes are listed in
+[CHANGELOG.md](CHANGELOG.md).
+
 ## License
 
-MIT - see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

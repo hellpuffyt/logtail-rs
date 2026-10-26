@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="480" viewBox="0 0 1200 480" role="img" aria-labelledby="t d">
+  <title id="t">logtail pipeline</title>
+  <desc id="d">Lines from a file, stdin or a followed file pass through LineReader, record parsing, the time-range filter and the query evaluator. Matching records are either printed directly or folded into the Aggregator, which uses a CardinalityGuard, per-group GroupState counters and ReservoirSampler percentiles, and is rendered as a table or JSON.</desc>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#A3AAA6"/>
+    </marker>
+  </defs>
+  <rect width="1200" height="480" fill="#0C0D0D"/>
+  <text x="30" y="44" fill="#EEEAE2" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="16">logtail</text>
+  <text x="30" y="68" fill="#A3AAA6" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13">One pass, one line at a time. Nothing is buffered as a collection of records; memory is bounded by the reservoir, the group cap and --max-line-bytes.</text>
+
+  <g font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">
+    <rect x="30" y="100" width="180" height="100" rx="6" fill="#17191A" stroke="#2A2E2D"/>
+    <text x="44" y="126" fill="#EEEAE2" font-size="13">FILE or stdin</text>
+    <text x="44" y="150" fill="#A3AAA6" font-size="11">-F: follow.rs</text>
+    <text x="44" y="168" fill="#A3AAA6" font-size="11">Follower, detects</text>
+    <text x="44" y="186" fill="#A3AAA6" font-size="11">rotation, truncation</text>
+
+    <rect x="240" y="100" width="180" height="100" rx="6" fill="#17191A" stroke="#2A2E2D"/>
+    <text x="254" y="126" fill="#EEEAE2" font-size="13">lines.rs</text>
+    <text x="254" y="150" fill="#A3AAA6" font-size="11">LineReader</text>
+    <text x="254" y="168" fill="#A3AAA6" font-size="11">skips &gt; max-line-bytes</text>
+    <text x="254" y="186" fill="#A3AAA6" font-size="11">and non-UTF-8 lines</text>
+
+    <rect x="450" y="100" width="180" height="100" rx="6" fill="#17191A" stroke="#2A2E2D"/>
+    <text x="464" y="126" fill="#EEEAE2" font-size="13">record.rs</text>
+    <text x="464" y="150" fill="#A3AAA6" font-size="11">parse_line -&gt; object</text>
+    <text x="464" y="168" fill="#A3AAA6" font-size="11">or counted malformed</text>
+    <text x="464" y="186" fill="#A3AAA6" font-size="11">dotted-field lookup</text>
+
+    <rect x="660" y="100" width="180" height="100" rx="6" fill="#17191A" stroke="#2A2E2D"/>
+    <text x="674" y="126" fill="#EEEAE2" font-size="13">window.rs</text>
+    <text x="674" y="150" fill="#A3AAA6" font-size="11">--since / --until</text>
+    <text x="674" y="168" fill="#A3AAA6" font-size="11">RFC3339 or epoch</text>
+    <text x="674" y="186" fill="#A3AAA6" font-size="11">s / ms timestamps</text>
+
+    <rect x="870" y="100" width="300" height="100" rx="6" fill="#17191A" stroke="#2A2E2D"/>
+    <text x="884" y="126" fill="#EEEAE2" font-size="13">query/</text>
+    <text x="884" y="150" fill="#A3AAA6" font-size="11">lexer -&gt; parser -&gt; Expr (ast.rs)</text>
+    <text x="884" y="168" fill="#A3AAA6" font-size="11">eval(Expr, record) -&gt; bool</text>
+    <text x="884" y="186" fill="#A3AAA6" font-size="11">regexes compiled once</text>
+
+    <rect x="870" y="290" width="300" height="80" rx="6" fill="#17191A" stroke="#2A2E2D"/>
+    <text x="884" y="316" fill="#EEEAE2" font-size="13">output.rs (no --agg)</text>
+    <text x="884" y="340" fill="#A3AAA6" font-size="11">each match printed as it arrives,</text>
+    <text x="884" y="358" fill="#A3AAA6" font-size="11">one JSON object per line</text>
+
+    <rect x="330" y="262" width="500" height="148" rx="6" fill="#17191A" stroke="#2A2E2D"/>
+    <text x="344" y="288" fill="#EEEAE2" font-size="13">agg.rs Aggregator.observe()</text>
+    <rect x="344" y="304" width="150" height="90" rx="4" fill="#0C0D0D" stroke="#2A2E2D"/>
+    <text x="356" y="326" fill="#EEEAE2" font-size="11">CardinalityGuard</text>
+    <text x="356" y="346" fill="#A3AAA6" font-size="11">cap groups,</text>
+    <text x="356" y="364" fill="#A3AAA6" font-size="11">fold the rest</text>
+    <text x="356" y="382" fill="#A3AAA6" font-size="11">into overflow</text>
+    <rect x="505" y="304" width="150" height="90" rx="4" fill="#0C0D0D" stroke="#2A2E2D"/>
+    <text x="517" y="326" fill="#EEEAE2" font-size="11">GroupState</text>
+    <text x="517" y="346" fill="#A3AAA6" font-size="11">count, sum,</text>
+    <text x="517" y="364" fill="#A3AAA6" font-size="11">min, max, avg</text>
+    <text x="517" y="382" fill="#A3AAA6" font-size="11">per field</text>
+    <rect x="666" y="304" width="150" height="90" rx="4" fill="#0C0D0D" stroke="#2A2E2D"/>
+    <text x="678" y="326" fill="#3FBF8A" font-size="11">ReservoirSampler</text>
+    <text x="678" y="346" fill="#A3AAA6" font-size="11">Algorithm R,</text>
+    <text x="678" y="364" fill="#A3AAA6" font-size="11">10,000 samples</text>
+    <text x="678" y="382" fill="#A3AAA6" font-size="11">-&gt; pN estimates</text>
+
+    <rect x="30" y="290" width="260" height="80" rx="6" fill="#17191A" stroke="#2A2E2D"/>
+    <text x="44" y="316" fill="#EEEAE2" font-size="13">output.rs (--agg)</text>
+    <text x="44" y="340" fill="#A3AAA6" font-size="11">at end of input, or after</text>
+    <text x="44" y="358" fill="#A3AAA6" font-size="11">each -F poll: table, json, ndjson</text>
+
+    <text x="1032" y="244" fill="#A3AAA6" font-size="11">match</text>
+    <text x="756" y="224" fill="#A3AAA6" font-size="11">match + --agg</text>
+  </g>
+
+  <g stroke="#A3AAA6" stroke-width="1.4" fill="none" marker-end="url(#a)">
+    <path d="M210 150H238"/>
+    <path d="M420 150H448"/>
+    <path d="M630 150H658"/>
+    <path d="M840 150H868"/>
+    <path d="M1020 200V288"/>
+    <path d="M900 200V232H580V260"/>
+    <path d="M330 330H292"/>
+  </g>
+
+  <text x="30" y="452" fill="#A3AAA6" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13">Skipped malformed, non-UTF-8 and over-long lines are counted and reported on stderr. --window adds a _window_start group key before aggregation.</text>
+</svg>
